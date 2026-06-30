@@ -1,11 +1,7 @@
 name: Windows Test Build
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - master
-      - system_file_cia_fix
     tags:
       - "*"
 
@@ -17,18 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-msys2:
-    name: Windows x64 MSYS2
-    runs-on: windows-latest
+  windows-mxe:
+    name: Windows x64 MXE
+    runs-on: ubuntu-latest
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
     defaults:
       run:
-        shell: msys2 {0}
+        shell: bash
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPILERCHECK: content
       CCACHE_SLOPPINESS: time_macros
       OS: windows
-      TARGET: msys2
+      TARGET: mxe
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -39,40 +38,54 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: windows-msys2-${{ github.sha }}
+          key: windows-mxe-${{ github.sha }}
           restore-keys: |
-            windows-msys2-
-
-      - name: Set up MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: clang64
-          update: true
-          install: git make p7zip
-          pacboy: >-
-            toolchain:p ccache:p cmake:p ninja:p spirv-tools:p
-            qt6-base:p qt6-multimedia:p qt6-multimedia-wmf:p qt6-tools:p qt6-translations:p
+            windows-mxe-
 
       - name: Disable line ending translation
         run: git config --global core.autocrlf input
 
-      - name: Build Windows bundle
-        run: ./.ci/windows.sh
+      - name: Build Windows bundle with MXE
+        run: ./.ci/mxe.sh
+
+      - name: Write build manifest
+        run: |
+          set -euo pipefail
+          mkdir -p build/bundle artifacts
+          cat > build/DENZEN-BUILD-MANIFEST.txt <<EOF
+          Denzen build manifest
+          repository=${GITHUB_REPOSITORY}
+          workflow=${GITHUB_WORKFLOW}
+          run_id=${GITHUB_RUN_ID}
+          run_number=${GITHUB_RUN_NUMBER}
+          ref=${GITHUB_REF}
+          ref_type=${GITHUB_REF_TYPE}
+          ref_name=${GITHUB_REF_NAME}
+          commit=${GITHUB_SHA}
+          build_path=github-actions-mxe
+          builder_script=.ci/mxe.sh
+          target=windows-mxe
+          built_at_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          EOF
+          cp build/DENZEN-BUILD-MANIFEST.txt build/bundle/DENZEN-BUILD-MANIFEST.txt
 
       - name: Pack artifact
         run: ./.ci/pack.sh
 
+      - name: Preserve build manifest
+        run: cp build/DENZEN-BUILD-MANIFEST.txt artifacts/denzen-build-manifest-${{ github.sha }}.txt
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: denzen-emu-windows-msys2-${{ github.sha }}
+          name: denzen-emu-windows-mxe-${{ github.sha }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 14
 
   publish-release:
     name: Publish GitHub release
-    needs: windows-msys2
+    needs: windows-mxe
     if: ${{ github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     permissions:
@@ -82,8 +95,8 @@ jobs:
       - name: Download Windows artifact
         uses: actions/download-artifact@v7
         with:
-          name: denzen-emu-windows-msys2-${{ github.sha }}
-          path: release-artifacts/windows-msys2
+          name: denzen-emu-windows-mxe-${{ github.sha }}
+          path: release-artifacts/windows-mxe
 
       - name: Prepare release assets
         shell: bash
@@ -114,9 +127,10 @@ jobs:
           set -euo pipefail
 
           cat > release-notes.md <<EOF
-          Automated Denzen Windows build for ${TAG_NAME}.
+          Automated Denzen Windows MXE build for ${TAG_NAME}.
 
           Built from commit ${GITHUB_SHA} by the Windows Test Build workflow.
+          Build path: GitHub Actions MXE using .ci/mxe.sh.
           EOF
 
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

@@ -1,8 +1,7 @@
 name: citra-transifex
 
 on:
-  push:
-    branches: [ master ]
+  workflow_dispatch:
 
 jobs:
   transifex:
