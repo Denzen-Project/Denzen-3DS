@@ -46,7 +46,7 @@ jobs:
         run: git config --global core.autocrlf input
 
       - name: Build Windows bundle with MXE
-        run: ./.ci/mxe.sh
+        run: bash -ex ./.ci/mxe.sh
 
       - name: Write build manifest
         run: |
@@ -70,7 +70,7 @@ jobs:
           cp build/DENZEN-BUILD-MANIFEST.txt build/bundle/DENZEN-BUILD-MANIFEST.txt
 
       - name: Pack artifact
-        run: ./.ci/pack.sh
+        run: bash -ex ./.ci/pack.sh
 
       - name: Preserve build manifest
         run: cp build/DENZEN-BUILD-MANIFEST.txt artifacts/denzen-build-manifest-${{ github.sha }}.txt
