@@ -1,9 +1,10 @@
-// Copyright 2022 Citra Emulator Project
+// Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
 #include <bit>
-#include <functional>
 #include "common/common_types.h"
 #include "common/string_literal.h"
 #include "core/arm/dynarmic/arm_tick_counts.h"
@@ -16,102 +17,232 @@ constexpr u32 GetMatchingBitsFromStringLiteral() {
     for (std::size_t i = 0; i < haystack.strlen; i++) {
         for (std::size_t a = 0; a < needle.strlen; a++) {
             if (haystack.value[i] == needle.value[a]) {
-                result |= 1 << (haystack.strlen - 1 - i);
+                result |= 1U << (haystack.strlen - 1 - i);
             }
         }
     }
     return result;
 }
 
+// Compress the bits selected by mask_ into the low bits of the result. The previous
+// deposit-style helper tested low source bits instead of the selected instruction bits.
 template <u32 mask_>
-constexpr u32 DepositBits(u32 val) {
+constexpr u32 ExtractBits(u32 value) {
     u32 mask = mask_;
-    u32 res = 0;
-    for (u32 bb = 1; mask; bb += bb) {
-        u32 neg_mask = 0 - mask;
-        if (val & bb)
-            res |= mask & neg_mask;
+    u32 result = 0;
+    for (u32 output_bit = 1; mask != 0; output_bit <<= 1) {
+        const u32 lowest_bit = mask & (0U - mask);
+        if ((value & lowest_bit) != 0) {
+            result |= output_bit;
+        }
         mask &= mask - 1;
     }
-    return res;
+    return result;
 }
 
-template <Common::StringLiteral haystack>
+template <Common::StringLiteral encoding>
 struct MatcherArg {
-    template <Common::StringLiteral needle>
-    u32 Get() {
-        return DepositBits<GetMatchingBitsFromStringLiteral<haystack, needle>()>(instruction);
+    template <Common::StringLiteral field>
+    constexpr u32 Get() const {
+        return ExtractBits<GetMatchingBitsFromStringLiteral<encoding, field>()>(instruction);
     }
 
     u32 instruction;
 };
 
+using TickFunction = u64 (*)(u32);
+
 struct Matcher {
     u32 mask;
     u32 expect;
-    std::function<u64(u32)> fn;
+    TickFunction fn;
 };
 
+// Denzen's tick callback is intentionally a deterministic scalar approximation. ARM11
+// prediction history, data alignment, interlocks, and pipeline overlap are not available here.
+constexpr u32 condition_always = 0b1110;
+constexpr u64 pipeline_flush_cycles = 7;
+constexpr u64 predicted_return_cycles = 4;
+constexpr u64 conditional_return_cycles = 7;
+constexpr u64 indirect_branch_cycles = 5;
+constexpr u64 pc_load_fast_cycles = 8;
+constexpr u64 pc_load_slow_cycles = 9;
+
+constexpr u64 TransferCycles(u32 words) {
+    return std::max<u64>(1, (words + 1) / 2);
+}
+
+auto IsUnconditional(auto i) {
+    return i.template Get<"c">() == condition_always;
+}
+
 u64 DataProcessing_imm(auto i) {
-    if (i.template Get<"d">() == 15) {
-        return 7;
-    }
-    return 1;
+    return i.template Get<"d">() == 15 ? pipeline_flush_cycles : 1;
 }
+
 u64 DataProcessing_reg(auto i) {
-    if (i.template Get<"d">() == 15) {
-        return 7;
-    }
-    return 1;
+    return i.template Get<"d">() == 15 ? pipeline_flush_cycles : 1;
 }
+
 u64 DataProcessing_rsr(auto i) {
-    if (i.template Get<"d">() == 15) {
-        return 8;
+    return i.template Get<"d">() == 15 ? pipeline_flush_cycles + 1 : 2;
+}
+
+u64 MovReg(auto i) {
+    if (i.template Get<"d">() != 15) {
+        return 1;
     }
-    return 2;
+
+    const bool is_return = i.template Get<"S">() == 0 && i.template Get<"m">() == 14 &&
+                           i.template Get<"v">() == 0 && i.template Get<"r">() == 0;
+    if (!is_return) {
+        return pipeline_flush_cycles;
+    }
+    return IsUnconditional(i) ? predicted_return_cycles : conditional_return_cycles;
 }
-u64 LoadStoreSingle_imm(auto) {
-    return 2;
+
+u64 ArmBx(auto i) {
+    if (i.template Get<"m">() != 14) {
+        return indirect_branch_cycles;
+    }
+    return IsUnconditional(i) ? predicted_return_cycles : conditional_return_cycles;
 }
-u64 LoadStoreSingle_reg(auto i) {
-    // TODO: Load PC
-    if (i.template Get<"u">() == 1 && i.template Get<"r">() == 0 &&
-        (i.template Get<"v">() == 0 || i.template Get<"v">() == 2)) {
+
+u64 ThumbMovReg(auto i) {
+    if (i.template Get<"d">() != 15) {
+        return 1;
+    }
+    return i.template Get<"m">() == 14 ? predicted_return_cycles : indirect_branch_cycles;
+}
+
+u64 LoadImm(auto i) {
+    if (i.template Get<"t">() != 15) {
+        return 1;
+    }
+    if (i.template Get<"n">() == 13) {
+        return IsUnconditional(i) ? predicted_return_cycles : pc_load_fast_cycles;
+    }
+    return pc_load_fast_cycles;
+}
+
+u64 LoadLiteral(auto i) {
+    return i.template Get<"t">() == 15 ? pc_load_fast_cycles : 1;
+}
+
+u64 LoadRegister(auto i) {
+    const bool fast_address = i.template Get<"u">() == 1 && i.template Get<"r">() == 0 &&
+                              (i.template Get<"v">() == 0 || i.template Get<"v">() == 2);
+    if (i.template Get<"t">() == 15) {
+        return fast_address ? pc_load_fast_cycles : pc_load_slow_cycles;
+    }
+    return fast_address ? 1 : 2;
+}
+
+u64 StoreRegister(auto i) {
+    const bool fast_address = i.template Get<"u">() == 1 && i.template Get<"r">() == 0 &&
+                              (i.template Get<"v">() == 0 || i.template Get<"v">() == 2);
+    return fast_address ? 1 : 2;
+}
+
+u64 RegisterOffsetNoShift(auto i) {
+    return i.template Get<"u">() == 1 ? 1 : 2;
+}
+
+u64 PldRegister(auto i) {
+    const bool fast_address = i.template Get<"u">() == 1 && i.template Get<"t">() == 0 &&
+                              (i.template Get<"i">() == 0 || i.template Get<"i">() == 2);
+    return fast_address ? 1 : 2;
+}
+
+u64 LoadMultiple(auto i) {
+    const u32 register_list = i.template Get<"x">();
+    const u32 register_count = std::popcount(register_list);
+    if ((register_list & (1U << 15)) == 0) {
+        return TransferCycles(register_count);
+    }
+
+    // Loading PC adds a separate memory access after the other registers.
+    const u64 memory_cycles = 1 + register_count / 2;
+    u64 branch_cycles = pc_load_fast_cycles;
+    if (!IsUnconditional(i)) {
+        branch_cycles = pc_load_slow_cycles;
+    } else if (i.template Get<"n">() == 13) {
+        branch_cycles = predicted_return_cycles;
+    }
+    return std::max(memory_cycles, branch_cycles);
+}
+
+u64 StoreMultiple(auto i) {
+    return TransferCycles(std::popcount(i.template Get<"x">()));
+}
+
+u64 ThumbPush(auto i) {
+    return TransferCycles(std::popcount(i.template Get<"x">()));
+}
+
+u64 ThumbPop(auto i) {
+    const u32 register_list = i.template Get<"x">();
+    const u32 register_count = std::popcount(register_list);
+    if ((register_list & (1U << 8)) == 0) {
+        return TransferCycles(register_count);
+    }
+    return std::max<u64>(predicted_return_cycles, 1 + register_count / 2);
+}
+
+u64 VfpLoadStore(auto i) {
+    if (i.template Get<"p">() == 0 && i.template Get<"u">() == 0) {
+        // MCRR/MRRC share this encoding space; P=U=0 is not a VFP load/store mode.
         return 2;
     }
-    return 4;
-}
-u64 LoadStoreMultiple(auto i) {
-    // TODO: Load PC
-    return 1 + std::popcount(i.template Get<"x">()) / 2;
+    if (i.template Get<"p">() == 1 && i.template Get<"w">() == 0) {
+        return 1;
+    }
+    return TransferCycles(i.template Get<"v">());
 }
 
 #define INST(NAME, BS, CYCLES)                                                                     \
     Matcher{GetMatchingBitsFromStringLiteral<BS, "01">(),                                          \
             GetMatchingBitsFromStringLiteral<BS, "1">(),                                           \
-            std::function<u64(u32)>{[](u32 instruction) -> u64 {                                   \
-                [[maybe_unused]] MatcherArg<BS> i{instruction};                                    \
+            +[](u32 instruction) -> u64 {                                                          \
+                [[maybe_unused]] const MatcherArg<BS> i{instruction};                              \
                 return (CYCLES);                                                                   \
-            }}},
+            }},
 
 const std::array arm_matchers{
     // clang-format off
 
-    // Branch instructions
-    INST("BLX (imm)",           "1111101hvvvvvvvvvvvvvvvvvvvvvvvv",  5) // v5
-    INST("BLX (reg)",           "cccc000100101111111111110011mmmm",  6) // v5
-    INST("B",                   "cccc1010vvvvvvvvvvvvvvvvvvvvvvvv",  4) // v1
-    INST("BL",                  "cccc1011vvvvvvvvvvvvvvvvvvvvvvvv",  4) // v1
-    INST("BX",                  "cccc000100101111111111110001mmmm",  5) // v4T
+    // Direct branches use a documented warm, non-folded predictor approximation. Register
+    // branches are not predicted by the return stack unless they are recognized returns.
+    INST("BLX (imm)",           "1111101hvvvvvvvvvvvvvvvvvvvvvvvv",  1) // v5
+    INST("BLX (reg)",           "cccc000100101111111111110011mmmm",  indirect_branch_cycles) // v5
+    INST("B",                   "cccc1010vvvvvvvvvvvvvvvvvvvvvvvv",  1) // v1
+    INST("BL",                  "cccc1011vvvvvvvvvvvvvvvvvvvvvvvv",  1) // v1
+    INST("BX",                  "cccc000100101111111111110001mmmm",  ArmBx(i)) // v4T
     INST("BXJ",                 "cccc000100101111111111110010mmmm",  1) // v5J
+
+    // Floating-point (VFP11) entries must precede the generic coprocessor matchers. The
+    // DS-pipeline divide/sqrt throughput is 15/29 cycles. Only double multiply/MAC
+    // families have two-cycle FMAC throughput; double add/sub and other VFP operations
+    // remain one cycle.
+    INST("VDIV",                "cccc11101D00nnnndddd101zN0M0mmmm",  (i.template Get<"z">() ? 29 : 15)) // VFPv2
+    INST("VSQRT",               "cccc11101D110001dddd101z11M0mmmm",  (i.template Get<"z">() ? 29 : 15)) // VFPv2
+    INST("VMLA",                "cccc11100D00nnnndddd101zN0M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VMLS",                "cccc11100D00nnnndddd101zN1M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VNMLS",               "cccc11100D01nnnndddd101zN0M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VNMLA",               "cccc11100D01nnnndddd101zN1M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VMUL",                "cccc11100D10nnnndddd101zN0M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VNMUL",               "cccc11100D10nnnndddd101zN1M0mmmm",  (i.template Get<"z">() ? 2 : 1)) // VFPv2
+    INST("VFP DP op",           "cccc1110------------101z---0----",  1) // VFPv2
+    INST("VFP load/store",      "cccc110pu-w---------101-vvvvvvvv",  VfpLoadStore(i)) // VFPv2
 
     // Coprocessor instructions
     INST("CDP",                 "cccc1110ooooNNNNDDDDppppooo0MMMM",  1) // v2  (CDP2:  v5)
+    // MCRR/MRRC must precede the generic STC/LDC encodings that share this space.
+    INST("MCRR",                "cccc11000100uuuuttttppppooooMMMM",  2) // v5E (MCRR2: v6)
+    INST("MRRC",                "cccc11000101uuuuttttppppooooMMMM",  2) // v5E (MRRC2: v6)
     INST("LDC",                 "cccc110pudw1nnnnDDDDppppvvvvvvvv",  1) // v2  (LDC2:  v5)
     INST("MCR",                 "cccc1110ooo0NNNNttttppppooo1MMMM",  2) // v2  (MCR2:  v5)
-    INST("MCRR",                "cccc11000100uuuuttttppppooooMMMM",  2) // v5E (MCRR2: v6)
     INST("MRC",                 "cccc1110ooo1NNNNttttppppooo1MMMM",  2) // v2  (MRC2:  v5)
-    INST("MRRC",                "cccc11000101uuuuttttppppooooMMMM",  2) // v5E (MRRC2: v6)
     INST("STC",                 "cccc110pudw0nnnnDDDDppppvvvvvvvv",  1) // v2  (STC2:  v5)
 
     // Data Processing instructions
@@ -137,7 +268,7 @@ const std::array arm_matchers{
     INST("EOR (reg)",           "cccc0000001Snnnnddddvvvvvrr0mmmm",  DataProcessing_reg(i)) // v1
     INST("EOR (rsr)",           "cccc0000001Snnnnddddssss0rr1mmmm",  DataProcessing_rsr(i)) // v1
     INST("MOV (imm)",           "cccc0011101S0000ddddrrrrvvvvvvvv",  DataProcessing_imm(i)) // v1
-    INST("MOV (reg)",           "cccc0001101S0000ddddvvvvvrr0mmmm",  DataProcessing_reg(i)) // v1
+    INST("MOV (reg)",           "cccc0001101S0000ddddvvvvvrr0mmmm",  MovReg(i)) // v1
     INST("MOV (rsr)",           "cccc0001101S0000ddddssss0rr1mmmm",  DataProcessing_rsr(i)) // v1
     INST("MVN (imm)",           "cccc0011111S0000ddddrrrrvvvvvvvv",  DataProcessing_imm(i)) // v1
     INST("MVN (reg)",           "cccc0001111S0000ddddvvvvvrr0mmmm",  DataProcessing_reg(i)) // v1
@@ -185,7 +316,7 @@ const std::array arm_matchers{
 
     // Hint instructions
     INST("PLD (imm)",           "11110101uz01nnnn1111iiiiiiiiiiii",  1) // v5E for PLD; v7 for PLDW
-    INST("PLD (reg)",           "11110111uz01nnnn1111iiiiitt0mmmm",  1) // v5E for PLD; v7 for PLDW
+    INST("PLD (reg)",           "11110111uz01nnnn1111iiiiitt0mmmm",  PldRegister(i)) // v5E for PLD; v7 for PLDW
     INST("SEV",                 "----0011001000001111000000000100",  1) // v6K
     INST("WFE",                 "----0011001000001111000000000010",  1) // v6K
     INST("WFI",                 "----0011001000001111000000000011",  1) // v6K
@@ -213,44 +344,44 @@ const std::array arm_matchers{
     INST("STRBT (A2)",          "----0110-110---------------0----",  1) // v1
     INST("STRT (A1)",           "----0100-010--------------------",  1) // v1
     INST("STRT (A2)",           "----0110-010---------------0----",  1) // v1
-    INST("LDR (lit)",           "cccc0101u0011111ttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("LDR (imm)",           "cccc010pu0w1nnnnttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("LDR (reg)",           "cccc011pu0w1nnnnttttvvvvvrr0mmmm",  LoadStoreSingle_reg(i)) // v1
-    INST("LDRB (lit)",          "cccc0101u1011111ttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("LDRB (imm)",          "cccc010pu1w1nnnnttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("LDRB (reg)",          "cccc011pu1w1nnnnttttvvvvvrr0mmmm",  LoadStoreSingle_reg(i)) // v1
-    INST("LDRD (lit)",          "cccc0001u1001111ttttvvvv1101vvvv",  LoadStoreSingle_imm(i)) // v5E
-    INST("LDRD (imm)",          "cccc000pu1w0nnnnttttvvvv1101vvvv",  LoadStoreSingle_imm(i)) // v5E
-    INST("LDRD (reg)",          "cccc000pu0w0nnnntttt00001101mmmm",  LoadStoreSingle_reg(i)) // v5E
-    INST("LDRH (lit)",          "cccc000pu1w11111ttttvvvv1011vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRH (imm)",          "cccc000pu1w1nnnnttttvvvv1011vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRH (reg)",          "cccc000pu0w1nnnntttt00001011mmmm",  LoadStoreSingle_reg(i)) // v4
-    INST("LDRSB (lit)",         "cccc0001u1011111ttttvvvv1101vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRSB (imm)",         "cccc000pu1w1nnnnttttvvvv1101vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRSB (reg)",         "cccc000pu0w1nnnntttt00001101mmmm",  LoadStoreSingle_reg(i)) // v4
-    INST("LDRSH (lit)",         "cccc0001u1011111ttttvvvv1111vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRSH (imm)",         "cccc000pu1w1nnnnttttvvvv1111vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("LDRSH (reg)",         "cccc000pu0w1nnnntttt00001111mmmm",  LoadStoreSingle_reg(i)) // v4
-    INST("STR (imm)",           "cccc010pu0w0nnnnttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("STR (reg)",           "cccc011pu0w0nnnnttttvvvvvrr0mmmm",  LoadStoreSingle_reg(i)) // v1
-    INST("STRB (imm)",          "cccc010pu1w0nnnnttttvvvvvvvvvvvv",  LoadStoreSingle_imm(i)) // v1
-    INST("STRB (reg)",          "cccc011pu1w0nnnnttttvvvvvrr0mmmm",  LoadStoreSingle_reg(i)) // v1
-    INST("STRD (imm)",          "cccc000pu1w0nnnnttttvvvv1111vvvv",  LoadStoreSingle_imm(i)) // v5E
-    INST("STRD (reg)",          "cccc000pu0w0nnnntttt00001111mmmm",  LoadStoreSingle_reg(i)) // v5E
-    INST("STRH (imm)",          "cccc000pu1w0nnnnttttvvvv1011vvvv",  LoadStoreSingle_imm(i)) // v4
-    INST("STRH (reg)",          "cccc000pu0w0nnnntttt00001011mmmm",  LoadStoreSingle_reg(i)) // v4
+    INST("LDR (lit)",           "cccc0101u0011111ttttvvvvvvvvvvvv",  LoadLiteral(i)) // v1
+    INST("LDR (imm)",           "cccc010pu0w1nnnnttttvvvvvvvvvvvv",  LoadImm(i)) // v1
+    INST("LDR (reg)",           "cccc011pu0w1nnnnttttvvvvvrr0mmmm",  LoadRegister(i)) // v1
+    INST("LDRB (lit)",          "cccc0101u1011111ttttvvvvvvvvvvvv",  LoadLiteral(i)) // v1
+    INST("LDRB (imm)",          "cccc010pu1w1nnnnttttvvvvvvvvvvvv",  LoadImm(i)) // v1
+    INST("LDRB (reg)",          "cccc011pu1w1nnnnttttvvvvvrr0mmmm",  LoadRegister(i)) // v1
+    INST("LDRD (lit)",          "cccc0001u1001111ttttvvvv1101vvvv",  1) // v5E
+    INST("LDRD (imm)",          "cccc000pu1w0nnnnttttvvvv1101vvvv",  1) // v5E
+    INST("LDRD (reg)",          "cccc000pu0w0nnnntttt00001101mmmm",  RegisterOffsetNoShift(i)) // v5E
+    INST("LDRH (lit)",          "cccc000pu1w11111ttttvvvv1011vvvv",  1) // v4
+    INST("LDRH (imm)",          "cccc000pu1w1nnnnttttvvvv1011vvvv",  1) // v4
+    INST("LDRH (reg)",          "cccc000pu0w1nnnntttt00001011mmmm",  RegisterOffsetNoShift(i)) // v4
+    INST("LDRSB (lit)",         "cccc0001u1011111ttttvvvv1101vvvv",  1) // v4
+    INST("LDRSB (imm)",         "cccc000pu1w1nnnnttttvvvv1101vvvv",  1) // v4
+    INST("LDRSB (reg)",         "cccc000pu0w1nnnntttt00001101mmmm",  RegisterOffsetNoShift(i)) // v4
+    INST("LDRSH (lit)",         "cccc0001u1011111ttttvvvv1111vvvv",  1) // v4
+    INST("LDRSH (imm)",         "cccc000pu1w1nnnnttttvvvv1111vvvv",  1) // v4
+    INST("LDRSH (reg)",         "cccc000pu0w1nnnntttt00001111mmmm",  RegisterOffsetNoShift(i)) // v4
+    INST("STR (imm)",           "cccc010pu0w0nnnnttttvvvvvvvvvvvv",  1) // v1
+    INST("STR (reg)",           "cccc011pu0w0nnnnttttvvvvvrr0mmmm",  StoreRegister(i)) // v1
+    INST("STRB (imm)",          "cccc010pu1w0nnnnttttvvvvvvvvvvvv",  1) // v1
+    INST("STRB (reg)",          "cccc011pu1w0nnnnttttvvvvvrr0mmmm",  StoreRegister(i)) // v1
+    INST("STRD (imm)",          "cccc000pu1w0nnnnttttvvvv1111vvvv",  1) // v5E
+    INST("STRD (reg)",          "cccc000pu0w0nnnntttt00001111mmmm",  RegisterOffsetNoShift(i)) // v5E
+    INST("STRH (imm)",          "cccc000pu1w0nnnnttttvvvv1011vvvv",  1) // v4
+    INST("STRH (reg)",          "cccc000pu0w0nnnntttt00001011mmmm",  RegisterOffsetNoShift(i)) // v4
 
     // Load/Store Multiple instructions
-    INST("LDM",                 "cccc100010w1nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("LDMDA",               "cccc100000w1nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("LDMDB",               "cccc100100w1nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("LDMIB",               "cccc100110w1nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
+    INST("LDM",                 "cccc100010w1nnnnxxxxxxxxxxxxxxxx",  LoadMultiple(i)) // v1
+    INST("LDMDA",               "cccc100000w1nnnnxxxxxxxxxxxxxxxx",  LoadMultiple(i)) // v1
+    INST("LDMDB",               "cccc100100w1nnnnxxxxxxxxxxxxxxxx",  LoadMultiple(i)) // v1
+    INST("LDMIB",               "cccc100110w1nnnnxxxxxxxxxxxxxxxx",  LoadMultiple(i)) // v1
     INST("LDM (usr reg)",       "----100--101--------------------",  1) // v1
     INST("LDM (exce ret)",      "----100--1-1----1---------------",  1) // v1
-    INST("STM",                 "cccc100010w0nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("STMDA",               "cccc100000w0nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("STMDB",               "cccc100100w0nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
-    INST("STMIB",               "cccc100110w0nnnnxxxxxxxxxxxxxxxx",  LoadStoreMultiple(i)) // v1
+    INST("STM",                 "cccc100010w0nnnnxxxxxxxxxxxxxxxx",  StoreMultiple(i)) // v1
+    INST("STMDA",               "cccc100000w0nnnnxxxxxxxxxxxxxxxx",  StoreMultiple(i)) // v1
+    INST("STMDB",               "cccc100100w0nnnnxxxxxxxxxxxxxxxx",  StoreMultiple(i)) // v1
+    INST("STMIB",               "cccc100110w0nnnnxxxxxxxxxxxxxxxx",  StoreMultiple(i)) // v1
     INST("STM (usr reg)",       "----100--100--------------------",  1) // v1
 
     // Miscellaneous instructions
@@ -370,7 +501,7 @@ const std::array arm_matchers{
     // clang-format on
 };
 
-const std::array thumb_matchers{
+const std::array thumb16_matchers{
     // clang-format off
 
     // Shift (immediate) add, subtract, move and compare instructions
@@ -400,33 +531,33 @@ const std::array thumb_matchers{
     INST("CMP (reg, T1)",            "0100001010mmmnnn",    1)
     INST("CMN (reg)",                "0100001011mmmnnn",    1)
     INST("ORR (reg)",                "0100001100mmmddd",    1)
-    INST("MUL (reg)",                "0100001101nnnddd",    1)
+    INST("MULS (reg)",               "0100001101nnnddd",    5)
     INST("BIC (reg)",                "0100001110mmmddd",    1)
     INST("MVN (reg)",                "0100001111mmmddd",    1)
 
     // Special data instructions
     INST("ADD (reg, T2)",            "01000100Dmmmmddd",    1) // v4T, Low regs: v6T2
     INST("CMP (reg, T2)",            "01000101Nmmmmnnn",    1) // v4T
-    INST("MOV (reg)",                "01000110Dmmmmddd",    1) // v4T, Low regs: v6
+    INST("MOV (reg)",                "01000110dmmmmddd",    ThumbMovReg(i)) // v4T, Low regs: v6
 
     // Store/Load single data item instructions
-    INST("LDR (literal)",            "01001tttvvvvvvvv",    2)
-    INST("STR (reg)",                "0101000mmmnnnttt",    2)
-    INST("STRH (reg)",               "0101001mmmnnnttt",    2)
-    INST("STRB (reg)",               "0101010mmmnnnttt",    2)
-    INST("LDRSB (reg)",              "0101011mmmnnnttt",    2)
-    INST("LDR (reg)",                "0101100mmmnnnttt",    2)
-    INST("LDRH (reg)",               "0101101mmmnnnttt",    2)
-    INST("LDRB (reg)",               "0101110mmmnnnttt",    2)
-    INST("LDRSH (reg)",              "0101111mmmnnnttt",    2)
-    INST("STR (imm, T1)",            "01100vvvvvnnnttt",    2)
-    INST("LDR (imm, T1)",            "01101vvvvvnnnttt",    2)
-    INST("STRB (imm)",               "01110vvvvvnnnttt",    2)
-    INST("LDRB (imm)",               "01111vvvvvnnnttt",    2)
-    INST("STRH (imm)",               "10000vvvvvnnnttt",    2)
-    INST("LDRH (imm)",               "10001vvvvvnnnttt",    2)
-    INST("STR (imm, T2)",            "10010tttvvvvvvvv",    2)
-    INST("LDR (imm, T2)",            "10011tttvvvvvvvv",    2)
+    INST("LDR (literal)",            "01001tttvvvvvvvv",    1)
+    INST("STR (reg)",                "0101000mmmnnnttt",    1)
+    INST("STRH (reg)",               "0101001mmmnnnttt",    1)
+    INST("STRB (reg)",               "0101010mmmnnnttt",    1)
+    INST("LDRSB (reg)",              "0101011mmmnnnttt",    1)
+    INST("LDR (reg)",                "0101100mmmnnnttt",    1)
+    INST("LDRH (reg)",               "0101101mmmnnnttt",    1)
+    INST("LDRB (reg)",               "0101110mmmnnnttt",    1)
+    INST("LDRSH (reg)",              "0101111mmmnnnttt",    1)
+    INST("STR (imm, T1)",            "01100vvvvvnnnttt",    1)
+    INST("LDR (imm, T1)",            "01101vvvvvnnnttt",    1)
+    INST("STRB (imm)",               "01110vvvvvnnnttt",    1)
+    INST("LDRB (imm)",               "01111vvvvvnnnttt",    1)
+    INST("STRH (imm)",               "10000vvvvvnnnttt",    1)
+    INST("LDRH (imm)",               "10001vvvvvnnnttt",    1)
+    INST("STR (imm, T2)",            "10010tttvvvvvvvv",    1)
+    INST("LDR (imm, T2)",            "10011tttvvvvvvvv",    1)
 
     // Generate relative address instructions
     INST("ADR",                      "10100dddvvvvvvvv",    1)
@@ -442,8 +573,8 @@ const std::array thumb_matchers{
     INST("SXTB",                     "1011001001mmmddd",    1) // v6
     INST("UXTH",                     "1011001010mmmddd",    1) // v6
     INST("UXTB",                     "1011001011mmmddd",    1) // v6
-    INST("PUSH",                     "1011010xxxxxxxxx",    LoadStoreMultiple(i)) // v4T
-    INST("POP",                      "1011110xxxxxxxxx",    LoadStoreMultiple(i)) // v4T
+    INST("PUSH",                     "1011010xxxxxxxxx",    ThumbPush(i)) // v4T
+    INST("POP",                      "1011110xxxxxxxxx",    ThumbPop(i)) // v4T
     INST("SETEND",                   "101101100101x000",    1) // v6
     INST("CPS",                      "10110110011m0aif",    1) // v6
     INST("REV",                      "1011101000mmmddd",    1) // v6
@@ -452,18 +583,26 @@ const std::array thumb_matchers{
     INST("BKPT",                     "10111110xxxxxxxx",    8) // v5
 
     // Store/Load multiple registers
-    INST("STMIA",                    "11000nnnxxxxxxxx",    LoadStoreMultiple(i))
-    INST("LDMIA",                    "11001nnnxxxxxxxx",    LoadStoreMultiple(i))
+    INST("STMIA",                    "11000nnnxxxxxxxx",    StoreMultiple(i))
+    INST("LDMIA",                    "11001nnnxxxxxxxx",    StoreMultiple(i))
 
     // Branch instructions
-    INST("BX",                       "010001110mmmm000",    5) // v4T
-    INST("BLX (reg)",                "010001111mmmm000",    6) // v5T
+    INST("BX",                       "010001110mmmm000",    (i.template Get<"m">() == 14 ? predicted_return_cycles : indirect_branch_cycles)) // v4T
+    INST("BLX (reg)",                "010001111mmmm000",    indirect_branch_cycles) // v5T
     INST("UDF",                      "11011110--------",    8)
     INST("SVC",                      "11011111xxxxxxxx",    8)
-    INST("B (T1)",                   "1101ccccvvvvvvvv",    4)
-    INST("B (T2)",                   "11100vvvvvvvvvvv",    4)
-    INST("BL (imm)",                 "11110Svvvvvvvvvv11j1jvvvvvvvvvvv",    4) // v4T
-    INST("BLX (imm)",                "11110Svvvvvvvvvv11j0jvvvvvvvvvvv",    5) // v5T
+    INST("B (T1)",                   "1101ccccvvvvvvvv",    1)
+    INST("B (T2)",                   "11100vvvvvvvvvvv",    1)
+
+    // clang-format on
+};
+
+const std::array thumb32_matchers{
+    // clang-format off
+
+    // Branch instructions (the only 32-bit encodings on ARMv6: BL/BLX prefix pairs)
+    INST("BL (imm)",                 "11110Svvvvvvvvvv11j1jvvvvvvvvvvv",    2) // v4T
+    INST("BLX (imm)",                "11110Svvvvvvvvvv11j0jvvvvvvvvvvv",    2) // v5T
 
     // clang-format on
 };
@@ -473,13 +612,29 @@ const std::array thumb_matchers{
 namespace Core {
 
 u64 TicksForInstruction(bool is_thumb, u32 instruction) {
-    if (is_thumb) {
-        return 1;
-    }
-
     const auto matches_instruction = [instruction](const auto& matcher) {
         return (instruction & matcher.mask) == matcher.expect;
     };
+
+    if (is_thumb) {
+        // dynarmic passes 16-bit Thumb instructions zero-extended and 32-bit ones
+        // (BL/BLX prefix+suffix pairs on ARMv6) with the first halfword in the
+        // upper 16 bits
+        if ((instruction >> 16) != 0) {
+            auto iter =
+                std::find_if(thumb32_matchers.begin(), thumb32_matchers.end(), matches_instruction);
+            if (iter != thumb32_matchers.end()) {
+                return iter->fn(instruction);
+            }
+            return 1;
+        }
+        auto iter =
+            std::find_if(thumb16_matchers.begin(), thumb16_matchers.end(), matches_instruction);
+        if (iter != thumb16_matchers.end()) {
+            return iter->fn(instruction);
+        }
+        return 1;
+    }
 
     auto iter = std::find_if(arm_matchers.begin(), arm_matchers.end(), matches_instruction);
     if (iter != arm_matchers.end()) {

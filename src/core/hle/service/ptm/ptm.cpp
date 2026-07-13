@@ -136,12 +136,18 @@ void Module::Interface::CheckNew3DS(Kernel::HLERequestContext& ctx) {
 
 void Module::Interface::ConfigureNew3DSCPU(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    const bool enable = rp.Pop<bool>();
+    const u8 config = rp.Pop<u8>();
+
+    if (Settings::values.is_new_3ds.GetValue()) {
+        ptm->system.Kernel().ConfigureNew3dsCpu(config);
+    } else {
+        ptm->system.Kernel().ConfigureNew3dsCpu(0);
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
 
-    LOG_WARNING(Service_PTM, "(STUBBED) enable={}", enable);
+    LOG_DEBUG(Service_PTM, "called config=0x{:02X}", config & 0x3);
 }
 
 void Module::Interface::SetInfoLEDPattern(Kernel::HLERequestContext& ctx) {

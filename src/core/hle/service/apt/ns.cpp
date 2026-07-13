@@ -61,6 +61,7 @@ std::shared_ptr<Kernel::Process> LaunchTitle(Core::System& system, FS::MediaType
     Loader::ResultStatus result = loader->Load(process);
 
     if (result != Loader::ResultStatus::Success) {
+        system.Kernel().RestoreCPUAndMemoryState(title_id);
         LOG_WARNING(Service_NS, "Error loading .app for title 0x{:016x}", title_id);
         return nullptr;
     }

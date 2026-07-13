@@ -6,7 +6,8 @@
 
 /**
  * This is a system to schedule events into the emulated machine's future. Time is measured
- * in main CPU clock cycles.
+ * in the fixed 268 MHz ARM11 system-tick domain. CPU execution may run multiple guest cycles
+ * per system tick without changing event or svcGetSystemTick time.
  *
  * To schedule an event, you first have to register its type. This is where you pass in the
  * callback. You then schedule events using the type id you get back.
@@ -18,6 +19,7 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <string>
@@ -203,6 +205,9 @@ public:
 
         s64 GetDowncount() const;
 
+        /// Guest CPU cycles required to consume the current fixed-tick slice.
+        u64 GetGuestTicksUntilSliceEnd() const;
+
         void ForceExceptionCheck(s64 cycles);
 
         void MoveEvents();
@@ -232,12 +237,13 @@ public:
         s64 executed_ticks = 0;
         u64 idled_cycles = 0;
 
-        // Stores a scaling for the internal clockspeed. Changing this number results in
-        // under/overclocking the guest cpu
+        // Converts guest CPU cycles into the fixed 268 MHz system-tick domain. Fractional
+        // carry is required at New 3DS speed so small interpreter/debugger steps still advance.
         double cpu_clock_scale = 1.0;
+        double cpu_tick_remainder = 0.0;
 
         template <class Archive>
-        void serialize(Archive& ar, const unsigned int) {
+        void serialize(Archive& ar, const unsigned int file_version) {
             MoveEvents();
             ar & event_queue;
             ar & event_fifo_id;
@@ -245,6 +251,16 @@ public:
             ar & downcount;
             ar & executed_ticks;
             ar & idled_cycles;
+            if (file_version >= 1) {
+                ar & cpu_tick_remainder;
+                if (Archive::is_loading::value &&
+                    (!std::isfinite(cpu_tick_remainder) || cpu_tick_remainder < 0.0 ||
+                     cpu_tick_remainder >= 1.0)) {
+                    cpu_tick_remainder = 0.0;
+                }
+            } else if (Archive::is_loading::value) {
+                cpu_tick_remainder = 0.0;
+            }
         }
         friend class boost::serialization::access;
     };
@@ -277,9 +293,14 @@ public:
     s64 GetGlobalTicks() const;
 
     /**
-     * Updates the value of the cpu clock scaling to the new percentage.
+     * Updates the user-configured CPU clock percentage.
      */
     void UpdateClockSpeed(u32 cpu_clock_percentage);
+
+    /**
+     * Sets the hardware CPU clock multiplier while keeping the system tick at 268 MHz.
+     */
+    void SetCpuClockMultiplier(u32 cpu_clock_multiplier);
 
     std::chrono::microseconds GetGlobalTimeUs() const;
 
@@ -301,6 +322,11 @@ private:
     std::vector<std::shared_ptr<Timer>> timers;
     Timer* current_timer = nullptr;
 
+    u32 cpu_clock_percentage = 100;
+    u32 cpu_clock_multiplier = 1;
+
+    void ApplyClockSpeed();
+
     // When true, the event queue can't be modified. Used while deserializing to workaround
     // destructor side effects.
     bool event_queue_locked = false;
@@ -320,3 +346,4 @@ private:
 } // namespace Core
 
 BOOST_CLASS_VERSION(Core::Timing, 1)
+BOOST_CLASS_VERSION(Core::Timing::Timer, 1)

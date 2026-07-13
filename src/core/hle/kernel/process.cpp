@@ -127,7 +127,7 @@ void KernelSystem::TerminateProcess(std::shared_ptr<Process> process) {
         GetThreadManager(core).TerminateProcessThreads(process);
     }
 
-    RestoreMemoryState(process->codeset->program_id);
+    RestoreCPUAndMemoryState(process->codeset->program_id);
 
     process->Exit();
     std::erase(process_list, process);

@@ -139,6 +139,13 @@ public:
          */
         void CheckNew3DS(Kernel::HLERequestContext& ctx);
 
+        /**
+         * PTM::ConfigureNew3DSCPU service function
+         *  Inputs:
+         *      1: u8 config: bit 0 enables 804 MHz, bit 1 enables the additional L2 cache.
+         *  Outputs:
+         *      1: Result code, 0 on success, otherwise error code
+         */
         void ConfigureNew3DSCPU(Kernel::HLERequestContext& ctx);
 
         void SetInfoLEDPattern(Kernel::HLERequestContext& ctx);

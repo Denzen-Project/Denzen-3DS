@@ -155,8 +155,7 @@ public:
         parent.GetTimer().AddTicks(ticks);
     }
     std::uint64_t GetTicksRemaining() override {
-        s64 ticks = parent.GetTimer().GetDowncount();
-        return static_cast<u64>(ticks <= 0 ? 0 : ticks);
+        return parent.GetTimer().GetGuestTicksUntilSliceEnd();
     }
     std::uint64_t GetTicksForCode(bool is_thumb, VAddr, std::uint32_t instruction) override {
         return Core::TicksForInstruction(is_thumb, instruction);

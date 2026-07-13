@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 #include <tuple>
 #include "common/assert.h"
@@ -43,9 +44,23 @@ s64 Timing::GenerateBaseTicks() {
     return random_gen();
 }
 
-void Timing::UpdateClockSpeed(u32 cpu_clock_percentage) {
+void Timing::UpdateClockSpeed(u32 new_cpu_clock_percentage) {
+    ASSERT(new_cpu_clock_percentage != 0);
+    cpu_clock_percentage = new_cpu_clock_percentage;
+    ApplyClockSpeed();
+}
+
+void Timing::SetCpuClockMultiplier(u32 new_cpu_clock_multiplier) {
+    ASSERT(new_cpu_clock_multiplier != 0);
+    cpu_clock_multiplier = new_cpu_clock_multiplier;
+    ApplyClockSpeed();
+}
+
+void Timing::ApplyClockSpeed() {
+    const double effective_percentage =
+        static_cast<double>(cpu_clock_percentage) * cpu_clock_multiplier;
     for (auto& timer : timers) {
-        timer->cpu_clock_scale = 100.0 / cpu_clock_percentage;
+        timer->cpu_clock_scale = 100.0 / effective_percentage;
     }
 }
 
@@ -176,7 +191,10 @@ u64 Timing::Timer::GetTicks() const {
 }
 
 void Timing::Timer::AddTicks(u64 ticks) {
-    downcount -= static_cast<u64>(ticks * cpu_clock_scale);
+    const double scaled_ticks = static_cast<double>(ticks) * cpu_clock_scale + cpu_tick_remainder;
+    const auto whole_ticks = static_cast<s64>(scaled_ticks);
+    cpu_tick_remainder = scaled_ticks - static_cast<double>(whole_ticks);
+    downcount -= whole_ticks;
 }
 
 u64 Timing::Timer::GetIdleTicks() const {
@@ -252,6 +270,34 @@ void Timing::Timer::Idle() {
 
 s64 Timing::Timer::GetDowncount() const {
     return downcount;
+}
+
+u64 Timing::Timer::GetGuestTicksUntilSliceEnd() const {
+    if (downcount <= 0) {
+        return 0;
+    }
+
+    ASSERT(std::isfinite(cpu_clock_scale) && cpu_clock_scale > 0.0);
+    ASSERT(std::isfinite(cpu_tick_remainder) && cpu_tick_remainder >= 0.0 &&
+           cpu_tick_remainder < 1.0);
+
+    const double required_ticks =
+        (static_cast<double>(downcount) - cpu_tick_remainder) / cpu_clock_scale;
+    u64 guest_ticks = std::max<u64>(1, static_cast<u64>(std::ceil(required_ticks)));
+
+    // Correct a possible one-ULP ceil error using the same arithmetic as AddTicks.
+    const auto consumes_slice = [this](u64 ticks) {
+        const double scaled_ticks =
+            static_cast<double>(ticks) * cpu_clock_scale + cpu_tick_remainder;
+        return static_cast<s64>(scaled_ticks) >= downcount;
+    };
+    while (guest_ticks > 1 && consumes_slice(guest_ticks - 1)) {
+        --guest_ticks;
+    }
+    while (!consumes_slice(guest_ticks)) {
+        ++guest_ticks;
+    }
+    return guest_ticks;
 }
 
 } // namespace Core

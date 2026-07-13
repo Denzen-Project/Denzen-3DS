@@ -78,6 +78,11 @@ enum class KernelState {
      */
     KERNEL_STATE_REBOOT = 7,
 
+    /**
+     * Configures the New 3DS CPU clock and additional L2 cache.
+     */
+    KERNEL_STATE_NEW_3DS_CPU = 10,
+
     // Special Citra only states.
     /**
      * Sets the emulation speed percentage. A value of 0 means unthrottled.
@@ -1475,6 +1480,15 @@ Result SVC::KernelSetState(u32 kernel_state, u32 varg1, u32 varg2) {
     // on emulator, we shutdown instead.
     case KernelState::KERNEL_STATE_REBOOT:
         system.RequestShutdown();
+        break;
+
+    case KernelState::KERNEL_STATE_NEW_3DS_CPU:
+        if (Settings::values.is_new_3ds.GetValue()) {
+            kernel.ConfigureNew3dsCpu(static_cast<u8>(varg1));
+        } else {
+            kernel.ConfigureNew3dsCpu(0);
+        }
+        LOG_DEBUG(Kernel_SVC, "ConfigureNew3DSCPU config=0x{:02X}", varg1 & 0x3);
         break;
 
     // Citra specific states.

@@ -27,7 +27,7 @@ void ARM_DynCom::Run() {
     if (break_flag) [[unlikely]] {
         return;
     }
-    ExecuteInstructions(std::max<s64>(timer->GetDowncount(), 0));
+    ExecuteInstructions(timer->GetGuestTicksUntilSliceEnd());
 }
 
 void ARM_DynCom::Step() {

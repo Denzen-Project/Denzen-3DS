@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
@@ -368,12 +369,19 @@ public:
         return memory_mode;
     }
 
-    void SetRunning804MHz(bool enable) {
-        running_804MHz = enable;
+    /// Applies svcKernelSetState type 10 bits: bit 0 is the 804 MHz clock and bit 1 is L2.
+    void ConfigureNew3dsCpu(u8 config);
+
+    u8 GetNew3dsCpuConfig() const {
+        return static_cast<u8>(running_804MHz) | (static_cast<u8>(l2_cache_enabled) << 1);
     }
 
     bool GetRunning804MHz() const {
         return running_804MHz;
+    }
+
+    bool GetL2CacheEnabled() const {
+        return l2_cache_enabled;
     }
 
     std::recursive_mutex& GetHLELock() {
@@ -413,7 +421,7 @@ public:
     void UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
                                  New3dsHwCapabilities n3ds_hw_cap);
 
-    void RestoreMemoryState(u64 title_id);
+    void RestoreCPUAndMemoryState(u64 title_id);
 
     void SetCore1ScheduleMode(Core1ScheduleMode mode);
 
@@ -462,6 +470,11 @@ private:
 
     MemoryMode memory_mode;
     bool running_804MHz = false;
+    bool l2_cache_enabled = false;
+
+    // Launches can temporarily replace the cluster-wide CPU mode while older processes remain
+    // suspended. Each entry stores the configuration that must be restored when that title exits.
+    std::vector<std::pair<u64, u8>> cpu_config_transitions;
 
     /*
      * Synchronizes access to the internal HLE kernel structures, it is acquired when a guest
@@ -487,5 +500,6 @@ private:
 
 } // namespace Kernel
 
+BOOST_CLASS_VERSION(Kernel::KernelSystem, 2)
 BOOST_CLASS_EXPORT_KEY(Kernel::New3dsHwCapabilities)
 BOOST_CLASS_EXPORT_KEY(Kernel::Core1CpuTime)

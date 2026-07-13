@@ -197,3 +197,66 @@ TEST_CASE("CoreTiming[ChainScheduling]", "[core]") {
 }
 
 // TODO: Add tests for multiple timers
+
+TEST_CASE("CoreTiming[New3DSClockMultiplier]", "[core]") {
+    Core::Timing timing(1, 100, 0);
+    const auto timer = timing.GetTimer(0);
+
+    timing.SetCpuClockMultiplier(3);
+    timer->SetNextSlice(3);
+
+    // The New 3DS clock executes three guest CPU cycles per fixed 268 MHz system tick.
+    // Fractional carry prevents small interpreter/debugger steps from disappearing.
+    timer->AddTicks(1);
+    REQUIRE(timer->GetDowncount() == 3);
+    timer->AddTicks(1);
+    REQUIRE(timer->GetDowncount() == 3);
+    timer->AddTicks(1);
+    REQUIRE(timer->GetDowncount() == 2);
+    for (int i = 0; i < 6; ++i) {
+        timer->AddTicks(1);
+    }
+    REQUIRE(timer->GetDowncount() == 0);
+
+    timer->Advance();
+    REQUIRE(timer->GetTicks() == 3);
+    REQUIRE(timing.GetGlobalTicks() == 3);
+
+    // The hardware multiplier composes with the existing user clock setting.
+    timing.UpdateClockSpeed(200);
+    timer->SetNextSlice(6);
+    timer->AddTicks(36);
+    REQUIRE(timer->GetDowncount() == 0);
+    timer->Advance();
+    REQUIRE(timer->GetTicks() == 9);
+
+    // Returning to the base hardware clock keeps the user setting intact.
+    timing.SetCpuClockMultiplier(1);
+    timer->SetNextSlice(6);
+    timer->AddTicks(12);
+    REQUIRE(timer->GetDowncount() == 0);
+}
+
+TEST_CASE("CoreTiming[AcceleratedGuestBudget]", "[core]") {
+    Core::Timing timing(4, 100, 0);
+    timing.SetCpuClockMultiplier(3);
+
+    for (u32 core = 0; core < 4; ++core) {
+        const auto timer = timing.GetTimer(core);
+        timer->SetNextSlice(120);
+        REQUIRE(timer->GetGuestTicksUntilSliceEnd() == 360);
+        timer->AddTicks(360);
+        REQUIRE(timer->GetDowncount() == 0);
+        timer->Advance();
+        REQUIRE(timer->GetTicks() == 120);
+    }
+
+    // A partially accumulated system tick reduces the remaining guest budget exactly.
+    const auto timer = timing.GetTimer(0);
+    timer->SetNextSlice(3);
+    timer->AddTicks(1);
+    REQUIRE(timer->GetDowncount() == 3);
+    REQUIRE(timer->GetGuestTicksUntilSliceEnd() == 8);
+    timer->AddTicks(8);
+    REQUIRE(timer->GetDowncount() == 0);
+}

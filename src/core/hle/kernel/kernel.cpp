@@ -2,12 +2,16 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <iterator>
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/unordered_map.hpp>
+#include <boost/serialization/utility.hpp>
 #include <boost/serialization/vector.hpp>
 #include "common/archives.h"
 #include "common/serialization/atomic.h"
 #include "common/settings.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/client_port.h"
 #include "core/hle/kernel/config_mem.h"
 #include "core/hle/kernel/handle_table.h"
@@ -171,11 +175,28 @@ void KernelSystem::ResetThreadIDs() {
     next_thread_id = 0;
 }
 
+void KernelSystem::ConfigureNew3dsCpu(u8 config) {
+    constexpr u8 config_mask = 0x3;
+    constexpr u32 new_3ds_clock_multiplier = 3;
+
+    config &= config_mask;
+    running_804MHz = (config & 0x1) != 0;
+    l2_cache_enabled = (config & 0x2) != 0;
+    timing.SetCpuClockMultiplier(running_804MHz ? new_3ds_clock_multiplier : 1);
+}
+
 void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
                                            New3dsHwCapabilities n3ds_hw_cap) {
+    u8 cpu_config = 0;
     if (Settings::values.is_new_3ds) {
-        SetRunning804MHz(n3ds_hw_cap.enable_804MHz_cpu);
+        cpu_config |= static_cast<u8>(n3ds_hw_cap.enable_804MHz_cpu);
+        cpu_config |= static_cast<u8>(n3ds_hw_cap.enable_l2_cache) << 1;
     }
+
+    // CPU clock and L2 state are cluster-wide. Keep the prior foreground state so an applet,
+    // application, or Home Menu process can restore the process it temporarily replaced.
+    cpu_config_transitions.emplace_back(title_id, GetNew3dsCpuConfig());
+    ConfigureNew3dsCpu(cpu_config);
 
     u32 tid_high = static_cast<u32>(title_id >> 32);
 
@@ -189,7 +210,25 @@ void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
     }
 }
 
-void KernelSystem::RestoreMemoryState(u64 title_id) {
+void KernelSystem::RestoreCPUAndMemoryState(u64 title_id) {
+    const auto transition =
+        std::find_if(cpu_config_transitions.rbegin(), cpu_config_transitions.rend(),
+                     [title_id](const auto& entry) { return entry.first == title_id; });
+    if (transition != cpu_config_transitions.rend()) {
+        const auto entry = std::prev(transition.base());
+        const u8 previous_config = entry->second;
+        const auto next = std::next(entry);
+
+        if (next == cpu_config_transitions.end()) {
+            ConfigureNew3dsCpu(previous_config);
+        } else {
+            // If a non-foreground process exits, bypass its state in the later transition so
+            // eventually unwinding the foreground process cannot restore a dead process's mode.
+            next->second = previous_config;
+        }
+        cpu_config_transitions.erase(entry);
+    }
+
     u32 tid_high = static_cast<u32>(title_id >> 32);
 
     constexpr u32 TID_HIGH_APPLET = 0x00040030;
@@ -211,7 +250,7 @@ void KernelSystem::UpdateCore1AppCpuLimit() {
 }
 
 template <class Archive>
-void KernelSystem::serialize(Archive& ar, const unsigned int) {
+void KernelSystem::serialize(Archive& ar, const unsigned int file_version) {
     ar & memory_regions;
     ar & named_ports;
     // current_cpu set externally
@@ -232,6 +271,16 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
     ar & next_thread_id;
     ar & memory_mode;
     ar & running_804MHz;
+    if (file_version >= 1) {
+        ar & l2_cache_enabled;
+    } else if (Archive::is_loading::value) {
+        l2_cache_enabled = false;
+    }
+    if (file_version >= 2) {
+        ar & cpu_config_transitions;
+    } else if (Archive::is_loading::value) {
+        cpu_config_transitions.clear();
+    }
     ar & main_thread_extended_sleep;
     // Deliberately don't include debugger info to allow debugging through loads
 
@@ -242,6 +291,9 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
         for (auto& process : process_list) {
             process->vm_manager.Unlock();
         }
+        // Timing is deserialized before the kernel. Reapply the hardware multiplier after
+        // restoring the authoritative CPU configuration.
+        ConfigureNew3dsCpu(GetNew3dsCpuConfig());
     }
 }
 SERIALIZE_IMPL(KernelSystem)
