@@ -1,8 +1,21 @@
 #!/bin/bash -ex
 
 # Determine the full revision name.
-GITDATE="`git show -s --date=short --format='%ad' | sed 's/-//g'`"
-GITREV="`git show -s --format='%h'`"
+if [[ -n "${DENZEN_SOURCE_DATE:-}" || -n "${DENZEN_SOURCE_REVISION:-}" ]]; then
+    if [[ ! "${DENZEN_SOURCE_DATE:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "DENZEN_SOURCE_DATE must use YYYY-MM-DD format" >&2
+        exit 1
+    fi
+    if [[ ! "${DENZEN_SOURCE_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "DENZEN_SOURCE_REVISION must be a 40-character lowercase Git SHA" >&2
+        exit 1
+    fi
+    GITDATE="${DENZEN_SOURCE_DATE//-/}"
+    GITREV="${DENZEN_SOURCE_REVISION:0:7}"
+else
+    GITDATE="$(git show -s --date=short --format='%ad' | sed 's/-//g')"
+    GITREV="$(git show -s --format='%h')"
+fi
 
 # Archive and upload the artifacts.
 mkdir -p artifacts
